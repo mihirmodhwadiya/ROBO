@@ -1,21 +1,26 @@
 # SERVO MOTOR & BATTERY TESTING GUIDE
 
-*Updated for the listed ESP32 robotics components*
-
 ## 1. Components covered
 
 This procedure uses the component list you supplied. Verify the exact servo model and wiring from its label or datasheet before applying power.
 
-| Component | Qty | Role in testing |
-| --- | --- | --- |
-| ESP32 development board | 1 | Runs the servo test sketch |
-| Servo / motor-related component (exact model to verify) | 10 | Test individually; label S01–S10 |
-| MINI560 DC 5 V 5 A step-down module | 1 | Regulates battery voltage to 5 V, if its input range/specification supports the pack |
-| 7.4 V 1000 mAh 2S Li-ion battery pack + charger | 1 pack | Power source; test pack voltage and condition |
-| Micro USB data cable | 1 | Upload code and view Serial Monitor |
-| Jumper wires | As listed | Signal and ground connections; ensure current-carrying power wires are suitable |
-| Multicolor wire | 4 × 1 m | Power wiring; verify gauge is adequate for servo current |
-| Male headers / PCB / filament | As listed | Assembly items; not required for initial bench testing |
+| Product                                                                 | Unit Price (₹) | Quantity | Line Total (₹) | LInks                                                                                                                                         |
+| ----------------------------------------------------------------------- | -------------- | -------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| TP4056 Battery Charging Protection Module (Type C)                      | ₹18.00         | 1        | ₹18.00         | [link](https://quartzcomponents.com/collections/all/products/tp4056-battery-charging-protection-module-type-c)                                |
+| WATTNINE® 7.4V 10000mAh Rechargeable Lithium Battery Pack with Warranty | ₹1,536.00      | 1        | ₹1,536.00      | [link](https://quartzcomponents.com/collections/all/products/7-4v-10000mah-rechargeable-lithium-battery-pack-with-warranty-includes-bms-2s2p) |
+| Wire Stripper and Cutter - 130mm                                        | ₹35.00         | 1        | ₹35.00         | [link](https://quartzcomponents.com/collections/all/products/wire-stripper-and-cutter-130mm)                                                  |
+| Flux Core Solder Wire 18SWG (50Gms) 40/60                               | ₹170.00        | 1        | ₹170.00        | [link](https://quartzcomponents.com/collections/all/products/flux-core-solder-wire-18swg-50gms)                                               |
+| Soldering and Desoldering Flux Paste (Yellow)                           | ₹22.00         | 1        | ₹22.00         | [link](https://quartzcomponents.com/collections/all/products/soldering-and-desoldering-flux-paste-white)                                      |
+| Soldering Iron Stand                                                    | ₹55.00         | 1        | ₹55.00         | [link](https://quartzcomponents.com/collections/all/products/soldering-iron-stand)                                                            |
+| Soldering Bit Cleaner Foam Pad                                          | ₹23.00         | 1        | ₹23.00         | [link](https://quartzcomponents.com/collections/all/products/soldering-bit-cleaner-foam-pad)                                                  |
+| Heat Shrink Sleeve Tube - 2mm Diameter - Black - 1 meter                | ₹7.00          | 3        | ₹21.00         | [link](https://quartzcomponents.com/collections/all/products/heat-shrink-tube-3-mm-diameter-black-1-meter)                                    |
+| 40 Pin Straight Female Header Pins - Berg Strips                        | ₹10.00         | 3        | ₹30.00         | [link](https://quartzcomponents.com/collections/all/products/40-pin-straight-female-berg-strips)                                              |
+| Ribbon Cable / Multi-Strand Cable (1 Meter) Good Quality                | ₹49.00         | 2        | ₹98.00         | [link](https://quartzcomponents.com/collections/all/products/ribbon-cable-multi-strand-cable-1-meter)                                         |
+| ESP32-C3 Super Mini Development Board - HW-466AB                        | ₹235.00        | 1        | ₹235.00        | [link](https://quartzcomponents.com/products/esp32-c3-super-mini-development-board-with-soldered-headers-hw-466ab)                            |
+| 9x15cm Double Sided Universal PCB Prototype Board                       | ₹108.00        | 1        | ₹108.00        | [link](https://quartzcomponents.com/collections/all/products/double-sided-universal-pcb-prototype-board-9x15cm)                               |
+| 3x7cm Double Sided Universal PCB Prototype Board                        | ₹25.00         | 1        | ₹25.00         | [link](https://quartzcomponents.com/collections/all/products/double-sided-universal-pcb-prototype-board-3x7cm)                                |
+| MINI560 5V 5A DC-DC Step-Down Stabilized Voltage Module                 | ₹65.00         | 1        | ₹65.00         | [link](https://quartzcomponents.com/collections/all/products/mini560-dc-dc-step-down-stabilized-voltage-module)                               |
+| TowardPro MG90S Mini Digital Servo Motor (180° Rotation) - High Quality | ₹279.00        | 9        | ₹2,511.00      | [link](https://robu.in/product/towardpro-mg90s-mini-digital-servo-2-2kg-0-08sec-13g/)                                                         |
 
 ## 2. Important safety rules
 
@@ -63,57 +68,7 @@ Connect ESP32 to the computer using the micro USB data cable. Keep the servo unl
 
 Wire colors vary; verify the actual servo pinout. Never connect the servo's +5 V lead to a GPIO.
 
-### 4.2 Arduino IDE test code
-
-```cpp
-#include <ESP32Servo.h>
-
-Servo testServo;
-
-const int SERVO_PIN = 13;  // Test one servo at a time
-
-void setup() {
-
-Serial.begin(115200);
-
-testServo.setPeriodHertz(50);
-
-testServo.attach(SERVO_PIN, 500, 2500);
-
-Serial.println("Servo test started");
-
-Serial.println("Keep the servo unloaded and watch for noise or heat");
-
-delay(1000);
-
-}
-
-void loop() {
-
-Serial.println("Position: 90 degrees");
-
-testServo.write(90);
-
-delay(1500);
-
-Serial.println("Position: 60 degrees");
-
-testServo.write(60);
-
-delay(1500);
-
-Serial.println("Position: 120 degrees");
-
-testServo.write(120);
-
-delay(1500);
-
-}
-```
-
-In Arduino IDE, select the correct ESP32 board and port, upload the sketch, then open Serial Monitor at 115200 baud. The sketch uses a moderate range; do not force the servo against mechanical end stops.
-
-### 4.3 Procedure and pass/fail criteria
+### 4.2 Procedure and pass/fail criteria
 
 Label the first servo S01. Inspect its case, shaft, cable, and connector.
 
@@ -201,16 +156,3 @@ Mark each field after testing. Add notes for any unusual behavior.
 Tested by: ________________________    Date: ________________
 
 Project / robot: _______________________________________________
-
-| No. | Component / Description | Qty |
-| --- | --- | --- |
-| 1 | eSun PLA+ Basic 1.75 mm 3D-printing filament, orange | 1 |
-| 2 | MINI560 DC 5V 5A, Step-Down Stabilized Module (link) | 1 |
-| 3 | 7.4V 1000mAh 14500 Li-Ion Rechargeable Battery Pack (2S) + its charger (link) | 1 |
-| 4 | ESP32 development board (link) | 1 |
-| 5 | SP SG90 Micro Servo Motor 9G RC Robot Helicopter Airplane Boat Controls (link) | 10 |
-| 6 | 15cm x 8.5cm Copper Clad Single Side 1mm PCB (local shop) | 1 |
-| 7 | Multi Color Wire 1 meter Each (local shop) | 2 (Red, black) |
-| 8 | Jumper Wires (M2M, M2F, F2F) (local shop) | 20 each x60 |
-| 9 | Micro USB Cable for uploading code (local shop) | 1 |
-| 10 | Male Pin Header With 2.54mm Pitch, 11.2mm Pin Length (local shop) | 2 |
