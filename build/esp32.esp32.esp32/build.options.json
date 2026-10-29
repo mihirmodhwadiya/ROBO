@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "../..,../..,../../..,../../..,../../..,../../..,../..,../..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "/home/mu/.arduino15/packages/esp32/hardware/esp32/3.3.12,/home/mu/.arduino15/packages/esp32/hardware/esp32/3.3.12",
+  "otherLibrariesFolders": "/home/mu/Arduino/libraries",
+  "sketchLocation": "/home/mu/Arduino/sesame_reobo"
+}

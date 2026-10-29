@@ -1,0 +1,3839 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
+#include <stdlib.h>
+#include <errno.h>
+
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+// =====================================================
+// FREERTOS TASKS AND SYNCHRONIZATION
+// =====================================================
+
+TaskHandle_t leftLegTaskHandle = NULL;
+TaskHandle_t rightLegTaskHandle = NULL;
+
+SemaphoreHandle_t leftServoMutex = NULL;
+SemaphoreHandle_t rightServoMutex = NULL;
+
+void takeAllServoMutexes() {
+    if (leftServoMutex != NULL) {
+        xSemaphoreTake(leftServoMutex, portMAX_DELAY);
+    }
+
+    if (rightServoMutex != NULL) {
+        xSemaphoreTake(rightServoMutex, portMAX_DELAY);
+    }
+}
+
+void giveAllServoMutexes() {
+    if (rightServoMutex != NULL) {
+        xSemaphoreGive(rightServoMutex);
+    }
+
+    if (leftServoMutex != NULL) {
+        xSemaphoreGive(leftServoMutex);
+    }
+}
+
+// =====================================================
+// SERVO OBJECTS
+// =====================================================
+
+// Elbow servos
+Servo R3_EL_Servo;
+Servo L4_EL_Servo;
+Servo L3_EL_Servo;
+Servo R4_EL_Servo;
+
+// Shoulder servos
+Servo R1_SHOUL_Servo;
+Servo R2_SHOUL_Servo;
+Servo L1_SHOUL_Servo;
+Servo L2_SHOUL_Servo;
+
+// =====================================================
+// HARDWARE GPIO PIN CONFIGURATION
+// =====================================================
+
+// Elbows
+#define R3_ELBOW       4
+#define L4_ELBOW       14
+#define L3_ELBOW       5
+#define R4_ELBOW       27
+
+// Shoulders
+#define R1_SHOULDER    12
+#define R2_SHOULDER    15
+#define L1_SHOULDER    13
+#define L2_SHOULDER    2
+
+// =====================================================
+// WIFI CONFIGURATION
+// =====================================================
+
+const char* ssid = "EMCAccess2.4";
+const char* password = "@!~electro123";
+
+WebServer server(80);
+
+// =====================================================
+// STRICT SERVO ANGLE LIMITS
+// =====================================================
+
+#define SHOULDER_MIN_ANGLE 0
+#define SHOULDER_MAX_ANGLE 90
+
+#define ELBOW_MIN_ANGLE 0
+#define ELBOW_MAX_ANGLE 180
+
+// =====================================================
+// DEFAULT POSITIONS
+//
+// These match your screenshots.
+// The Set All Defaults button and startup routine
+// both use these values.
+// =====================================================
+
+// Shoulder defaults
+#define DEFAULT_R1_SHOULDER 90
+#define DEFAULT_R2_SHOULDER 0
+#define DEFAULT_L1_SHOULDER 0
+#define DEFAULT_L2_SHOULDER 90
+
+// Elbow defaults
+#define DEFAULT_R3_ELBOW 180
+#define DEFAULT_L4_ELBOW 0
+#define DEFAULT_L3_ELBOW 0
+#define DEFAULT_R4_ELBOW 180
+
+// =====================================================
+// WALKING VERTICAL POSITIONS
+//
+// Kept separate from the startup/default positions.
+// =====================================================
+
+#define VERTICAL_LEG_VALUE_OF_R3_EL_Servo 70
+#define VERTICAL_LEG_VALUE_OF_L4_EL_Servo 20
+#define VERTICAL_LEG_VALUE_OF_L3_EL_Servo 20
+#define VERTICAL_LEG_VALUE_OF_R4_EL_Servo 70
+
+// =====================================================
+// 45-DEGREE ELBOW POSITIONS
+// =====================================================
+
+#define DEG45_LEG_VALUE_OF_R3_EL_Servo 45
+#define DEG45_LEG_VALUE_OF_L4_EL_Servo 45
+#define DEG45_LEG_VALUE_OF_L3_EL_Servo 45
+#define DEG45_LEG_VALUE_OF_R4_EL_Servo 45
+
+// =====================================================
+// HORIZONTAL ELBOW POSITIONS
+// =====================================================
+
+#define HORIZONTAL_LEG_VALUE_OF_R3_EL_Servo 90
+#define HORIZONTAL_LEG_VALUE_OF_L4_EL_Servo 90
+#define HORIZONTAL_LEG_VALUE_OF_L3_EL_Servo 90
+#define HORIZONTAL_LEG_VALUE_OF_R4_EL_Servo 90
+
+// =====================================================
+// WALKING SHOULDER POSITIONS
+//
+// Original calibrated walking stance.
+// Each value remains inside the shoulder 0-90 range.
+// =====================================================
+
+#define WALK_POS_R1_SHOULDER 90
+#define WALK_POS_R2_SHOULDER 0
+#define WALK_POS_L1_SHOULDER 15
+#define WALK_POS_L2_SHOULDER 75
+
+// =====================================================
+// CURRENT SERVO ANGLES
+// =====================================================
+
+int angleR1_SHOUL_Servo = DEFAULT_R1_SHOULDER;
+int angleR2_SHOUL_Servo = DEFAULT_R2_SHOULDER;
+int angleL1_SHOUL_Servo = DEFAULT_L1_SHOULDER;
+int angleL2_SHOUL_Servo = DEFAULT_L2_SHOULDER;
+
+int angleR3_EL_Servo = DEFAULT_R3_ELBOW;
+int angleL4_EL_Servo = DEFAULT_L4_ELBOW;
+int angleL3_EL_Servo = DEFAULT_L3_ELBOW;
+int angleR4_EL_Servo = DEFAULT_R4_ELBOW;
+
+// =====================================================
+// WALKING CONFIGURATION
+// =====================================================
+
+#define WALK_STEP 30
+#define DD 300
+#define ADD 15
+
+#define WALK_BACK_R3_MAX_ANGLE 25
+#define WALK_BACK_L3_MAX_ANGLE 65
+#define WALK_FRONT_L4_MAX_ANGLE 60
+
+volatile bool walking = false;
+volatile int walkPhase = 0;
+
+// =====================================================
+// SAY HI CONFIGURATION
+// =====================================================
+
+#define HI_BALANCE_L3_ANGLE 105
+#define HI_SHOULDER_L1_ANGLE 75
+
+#define HI_WAVE_MIN_ANGLE 135
+#define HI_WAVE_MAX_ANGLE 170
+
+#define HI_WAVE_DELAY 260
+#define HI_DEFAULT_CYCLES 3
+
+volatile bool wavingHi = false;
+volatile int waveCycle = 0;
+volatile int waveTargetCycles = HI_DEFAULT_CYCLES;
+volatile int waveStep = 0;
+
+unsigned long lastWaveTime = 0;
+
+int prevL4Angle = DEFAULT_L4_ELBOW;
+int prevL3Angle = DEFAULT_L3_ELBOW;
+int prevL1Angle = DEFAULT_L1_SHOULDER;
+
+// =====================================================
+// 360 ROTATION CONFIGURATION (L2 x23)
+// =====================================================
+
+#define SPIN360_DEFAULT_CYCLES 23
+#define SPIN360_DELAY 180
+
+volatile bool spinning360 = false;
+volatile int spin360Cycle = 0;
+volatile int spin360TargetCycles = SPIN360_DEFAULT_CYCLES;
+volatile int spin360Step = 0;
+
+unsigned long lastSpin360Time = 0;
+int prevL2Angle = DEFAULT_L2_SHOULDER;
+
+// =====================================================
+// FUNCTION DECLARATIONS
+// =====================================================
+
+int getServoMaxAngle(const String& name);
+int getServoDefaultAngle(const String& name);
+
+bool setServo(const String& name, long requestedAngle);
+
+void presetDefault();
+void startHi();
+void sayHi(int cycles = HI_DEFAULT_CYCLES);
+void stopHi();
+void updateHi();
+
+void start360(int cycles = SPIN360_DEFAULT_CYCLES);
+void stop360();
+void update360();
+void handle360();
+
+void handleRoot();
+void handleServo();
+void handlePreset();
+void handleWalk();
+void handleWalkStatus();
+void handleHi();
+void handleIP();
+void handleAngles();
+
+// =====================================================
+// SERVO RANGE LOOKUP
+// =====================================================
+
+int getServoMaxAngle(const String& name) {
+
+    // Shoulders: maximum 90 degrees
+    if (name == "R1_SHOUL_Servo" ||
+        name == "R2_SHOUL_Servo" ||
+        name == "L1_SHOUL_Servo" ||
+        name == "L2_SHOUL_Servo") {
+
+        return SHOULDER_MAX_ANGLE;
+    }
+
+    // Elbows: maximum 180 degrees
+    if (name == "R3_EL_Servo" ||
+        name == "L4_EL_Servo" ||
+        name == "L3_EL_Servo" ||
+        name == "R4_EL_Servo") {
+
+        return ELBOW_MAX_ANGLE;
+    }
+
+    return -1;
+}
+
+// =====================================================
+// DEFAULT ANGLE LOOKUP
+// =====================================================
+
+int getServoDefaultAngle(const String& name) {
+
+    if (name == "R1_SHOUL_Servo") {
+        return DEFAULT_R1_SHOULDER;
+    }
+
+    if (name == "R2_SHOUL_Servo") {
+        return DEFAULT_R2_SHOULDER;
+    }
+
+    if (name == "L1_SHOUL_Servo") {
+        return DEFAULT_L1_SHOULDER;
+    }
+
+    if (name == "L2_SHOUL_Servo") {
+        return DEFAULT_L2_SHOULDER;
+    }
+
+    if (name == "R3_EL_Servo") {
+        return DEFAULT_R3_ELBOW;
+    }
+
+    if (name == "L4_EL_Servo") {
+        return DEFAULT_L4_ELBOW;
+    }
+
+    if (name == "L3_EL_Servo") {
+        return DEFAULT_L3_ELBOW;
+    }
+
+    if (name == "R4_EL_Servo") {
+        return DEFAULT_R4_ELBOW;
+    }
+
+    return -1;
+}
+
+// =====================================================
+// STRICT SERVO CONTROL
+//
+// Valid commands:
+//   Shoulders: 0-90
+//   Elbows:    0-180
+//
+// If the requested angle is outside the permitted range,
+// that servo is reset to its own configured default.
+//
+// Unknown servo names are rejected.
+// =====================================================
+
+bool setServo(const String& name, long requestedAngle) {
+
+    int maxAngle = getServoMaxAngle(name);
+    int defaultAngle = getServoDefaultAngle(name);
+
+    if (maxAngle < 0 || defaultAngle < 0) {
+        Serial.println("ERROR: Unknown servo: " + name);
+        return false;
+    }
+
+    int targetAngle;
+
+    if (requestedAngle < SHOULDER_MIN_ANGLE ||
+        requestedAngle > maxAngle) {
+
+        targetAngle = defaultAngle;
+
+        Serial.println();
+        Serial.println("==========================================");
+        Serial.println("SERVO ANGLE LIMIT EXCEEDED");
+        Serial.println("Servo: " + name);
+
+        Serial.printf(
+            "Requested angle: %ld degrees\n",
+            requestedAngle
+        );
+
+        Serial.printf(
+            "Allowed range: 0-%d degrees\n",
+            maxAngle
+        );
+
+        Serial.printf(
+            "Reset position: %d degrees\n",
+            defaultAngle
+        );
+
+        Serial.println("==========================================");
+    }
+    else {
+        targetAngle = (int)requestedAngle;
+    }
+
+    // Left-side servo group, including R2 shoulder.
+    bool isLeftGroup =
+        name.startsWith("L") ||
+        name == "R2_SHOUL_Servo";
+
+    SemaphoreHandle_t mutex =
+        isLeftGroup ? leftServoMutex : rightServoMutex;
+
+    if (mutex == NULL) {
+        Serial.println("ERROR: Servo mutex unavailable.");
+        return false;
+    }
+
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        Serial.println("ERROR: Could not acquire servo mutex.");
+        return false;
+    }
+
+    // LEFT GROUP
+    if (isLeftGroup) {
+
+        if (name == "L1_SHOUL_Servo") {
+            L1_SHOUL_Servo.write(targetAngle);
+            angleL1_SHOUL_Servo = targetAngle;
+        }
+
+        else if (name == "L2_SHOUL_Servo") {
+            L2_SHOUL_Servo.write(targetAngle);
+            angleL2_SHOUL_Servo = targetAngle;
+        }
+
+        else if (name == "L3_EL_Servo") {
+            L3_EL_Servo.write(targetAngle);
+            angleL3_EL_Servo = targetAngle;
+        }
+
+        else if (name == "L4_EL_Servo") {
+            L4_EL_Servo.write(targetAngle);
+            angleL4_EL_Servo = targetAngle;
+        }
+
+        else if (name == "R2_SHOUL_Servo") {
+            R2_SHOUL_Servo.write(targetAngle);
+            angleR2_SHOUL_Servo = targetAngle;
+        }
+    }
+
+    // RIGHT GROUP
+    else {
+
+        if (name == "R1_SHOUL_Servo") {
+            R1_SHOUL_Servo.write(targetAngle);
+            angleR1_SHOUL_Servo = targetAngle;
+        }
+
+        else if (name == "R3_EL_Servo") {
+            R3_EL_Servo.write(targetAngle);
+            angleR3_EL_Servo = targetAngle;
+        }
+
+        else if (name == "R4_EL_Servo") {
+            R4_EL_Servo.write(targetAngle);
+            angleR4_EL_Servo = targetAngle;
+        }
+    }
+
+    xSemaphoreGive(mutex);
+
+    return true;
+}
+
+// =====================================================
+// WEB INTERFACE
+// =====================================================
+
+const char MAIN_page[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+
+<title>Robot Servo Calibrator</title>
+
+<style>
+
+:root {
+    --bg-main: #0e1117;
+    --bg-card: #181d27;
+    --bg-subtle: #242c3d;
+    --primary: #0084ff;
+    --shoulder-accent: #ff8800;
+    --success: #00c853;
+    --danger: #d50000;
+    --text-main: #f0f4f8;
+    --text-muted: #8c9ba5;
+    --border-color: #2b3547;
+    --border-radius: 12px;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: var(--bg-main);
+    color: var(--text-main);
+    font-family: Arial, Helvetica, sans-serif;
+    padding: 16px;
+    display: flex;
+    justify-content: center;
+}
+
+.app-container {
+    width: 100%;
+    max-width: 680px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+header {
+    text-align: center;
+    padding: 12px 0 6px;
+}
+
+h1 {
+    font-size: 1.55rem;
+    font-weight: 700;
+    color: white;
+}
+
+.ip-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-color);
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    color: #4dc3ff;
+    margin-top: 8px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 6px var(--success);
+}
+
+.tab-nav {
+    display: flex;
+    flex-wrap: wrap;
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: 4px;
+    gap: 4px;
+}
+
+.tab-btn {
+    flex: 1;
+    min-width: 115px;
+    background: transparent;
+    border: none;
+    padding: 10px 8px;
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.85rem;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.tab-btn.active {
+    background: var(--primary);
+    color: white;
+}
+
+.tab-btn.active.shoulder-tab-btn {
+    background: var(--shoulder-accent);
+}
+
+.tab-btn.active.ota-tab-btn {
+    background: #0284c7;
+}
+
+.panel {
+    display: none;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.panel.active {
+    display: flex;
+}
+
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: 16px;
+}
+
+.card.shoulder-card {
+    border-left: 4px solid var(--shoulder-accent);
+}
+
+.card.elbow-card {
+    border-left: 4px solid var(--primary);
+}
+
+.card.default-card {
+    border-left: 4px solid var(--success);
+}
+
+.card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.servo-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.servo-title {
+    font-weight: 700;
+    font-size: 1.02rem;
+}
+
+.servo-pin {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+.angle-display {
+    font-size: 1.35rem;
+    font-weight: 800;
+    color: #4dc3ff;
+    background: var(--bg-subtle);
+    padding: 6px 10px;
+    border-radius: 8px;
+    min-width: 65px;
+    text-align: center;
+}
+
+.shoulder-card .angle-display {
+    color: #ffaa44;
+}
+
+.slider-row {
+    margin: 10px 0 14px;
+}
+
+input[type=range] {
+    width: 100%;
+    height: 8px;
+    cursor: pointer;
+}
+
+.shoulder-card input[type=range] {
+    accent-color: var(--shoulder-accent);
+}
+
+.elbow-card input[type=range] {
+    accent-color: var(--primary);
+}
+
+.btn-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+}
+
+.btn-chip {
+    flex: 1;
+    min-width: 46px;
+    padding: 9px 5px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-color);
+    color: var(--text-main);
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: center;
+}
+
+.btn-chip:hover {
+    background: #323d54;
+}
+
+.btn-chip.highlight {
+    background: rgba(255, 136, 0, 0.15);
+    border-color: var(--shoulder-accent);
+    color: #ffaa44;
+}
+
+.btn-chip.highlight-green {
+    background: rgba(0, 200, 83, 0.12);
+    border-color: var(--success);
+    color: #00e664;
+}
+
+.btn-chip.highlight-blue {
+    background: rgba(0, 132, 255, 0.15);
+    border-color: var(--primary);
+    color: #4dc3ff;
+}
+
+.action-bar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(125px, 1fr));
+    gap: 8px;
+}
+
+.action-btn {
+    padding: 12px;
+    border: none;
+    border-radius: 9px;
+    font-size: 0.9rem;
+    font-weight: 700;
+    cursor: pointer;
+    text-align: center;
+}
+
+.action-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.btn-accent {
+    background: var(--shoulder-accent);
+    color: #111;
+}
+
+.btn-blue {
+    background: var(--primary);
+    color: white;
+}
+
+.btn-green {
+    background: var(--success);
+    color: white;
+}
+
+.btn-red {
+    background: var(--danger);
+    color: white;
+}
+
+.btn-purple {
+    background: #8b5cf6;
+    color: white;
+}
+
+.btn-dark {
+    background: var(--bg-subtle);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+}
+
+.default-button {
+    width: 100%;
+    padding: 15px;
+    font-size: 1rem;
+}
+
+.default-note {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    margin-top: 10px;
+    line-height: 1.6;
+}
+
+.code-container {
+    position: relative;
+    background: #090c10;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 14px;
+    margin-top: 10px;
+    font-family: monospace;
+    font-size: 0.85rem;
+    color: #58a6ff;
+    white-space: pre-wrap;
+    overflow-x: auto;
+}
+
+.copy-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-color);
+    color: white;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.status-footer {
+    text-align: center;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    padding: 6px 0;
+    line-height: 1.5;
+}
+
+.ota-file {
+    width: 100%;
+    padding: 12px;
+    margin: 12px 0;
+    background: #0e1117;
+    border: 1px dashed #475569;
+    border-radius: 8px;
+    color: var(--text-muted);
+}
+
+.progress-bar {
+    display: none;
+    width: 100%;
+    height: 12px;
+    background: #334155;
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 12px 0;
+}
+
+.progress-fill {
+    width: 0%;
+    height: 100%;
+    background: #38bdf8;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="app-container">
+
+<header>
+
+    <h1>Robot Servo Calibrator</h1>
+
+    <div class="ip-badge">
+        <div class="status-dot"></div>
+        <span>IP: <strong id="ipDisplay">Loading...</strong></span>
+    </div>
+
+</header>
+
+<nav class="tab-nav">
+
+    <button class="tab-btn active shoulder-tab-btn"
+            onclick="openTab('shoulders',this)">
+        Shoulder Calibration
+    </button>
+
+    <button class="tab-btn"
+            onclick="openTab('elbows',this)">
+        Elbows & Walk
+    </button>
+
+    <button class="tab-btn"
+            onclick="openTab('export',this)">
+        Export Offsets
+    </button>
+
+    <button class="tab-btn ota-tab-btn"
+            onclick="openTab('ota',this)">
+        OTA Update
+    </button>
+
+</nav>
+
+<!-- ================================================= -->
+<!-- SET ALL DEFAULTS BUTTON                            -->
+<!-- ================================================= -->
+
+<div class="card default-card">
+
+    <button class="action-btn btn-green default-button"
+            id="defaultButton"
+            onclick="presetDefault()">
+        SET ALL DEFAULTS
+    </button>
+
+    <p class="default-note">
+        Restores all eight servos to the positions shown in your
+        screenshots:
+        R1=90°, R2=0°, L1=0°, L2=90°,
+        R3=180°, L4=0°, L3=0°, R4=180°.
+        Stops walking and the Say Hi gesture first.
+    </p>
+
+</div>
+
+<!-- ================================================= -->
+<!-- SHOULDER TAB                                      -->
+<!-- ================================================= -->
+
+<div id="panel-shoulders" class="panel active">
+
+    <div class="card">
+
+        <div style="font-weight:700;margin-bottom:10px;color:#ffaa44;">
+            Shoulder Calibration & Stance Tools
+        </div>
+
+        <div class="action-bar">
+
+            <button class="action-btn btn-green"
+                    onclick="presetShoulderWalk()">
+                Walk Stance
+            </button>
+
+            <button class="action-btn btn-accent"
+                    onclick="setAllShoulders(45)">
+                Center All (45°)
+            </button>
+
+            <button class="action-btn btn-dark"
+                    onclick="setAllShoulders(0)">
+                Min All (0°)
+            </button>
+
+            <button class="action-btn btn-dark"
+                    onclick="setAllShoulders(90)">
+                Max All (90°)
+            </button>
+
+            <button class="action-btn btn-blue"
+                    onclick="runSweepTest()">
+                Sweep Test
+            </button>
+
+        </div>
+
+    </div>
+
+    <!-- R1 SHOULDER -->
+
+    <div class="card shoulder-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Back-Right Shoulder (R1)</div>
+                <div class="servo-pin">
+                    GPIO 12 · Allowed: 0°–90° · Default: 90°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_R1_SHOUL_Servo">90°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="R1_SHOUL_Servo"
+                   min="0" max="90" value="90"
+                   oninput="onSliderMove('R1_SHOUL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('R1_SHOUL_Servo',-5)">-5°</button>
+            <button class="btn-chip" onclick="nudge('R1_SHOUL_Servo',-1)">-1°</button>
+            <button class="btn-chip highlight-green" onclick="setExact('R1_SHOUL_Servo',90)">90° Default</button>
+            <button class="btn-chip" onclick="nudge('R1_SHOUL_Servo',1)">+1°</button>
+            <button class="btn-chip" onclick="nudge('R1_SHOUL_Servo',5)">+5°</button>
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="setExact('R1_SHOUL_Servo',0)">0°</button>
+            <button class="btn-chip" onclick="setExact('R1_SHOUL_Servo',30)">30°</button>
+            <button class="btn-chip" onclick="setExact('R1_SHOUL_Servo',60)">60°</button>
+            <button class="btn-chip" onclick="setExact('R1_SHOUL_Servo',90)">90°</button>
+        </div>
+
+    </div>
+
+    <!-- R2 SHOULDER -->
+
+    <div class="card shoulder-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Back-Left Shoulder (R2)</div>
+                <div class="servo-pin">
+                    GPIO 15 · Allowed: 0°–90° · Default: 0°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_R2_SHOUL_Servo">0°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="R2_SHOUL_Servo"
+                   min="0" max="90" value="0"
+                   oninput="onSliderMove('R2_SHOUL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('R2_SHOUL_Servo',-5)">-5°</button>
+            <button class="btn-chip" onclick="nudge('R2_SHOUL_Servo',-1)">-1°</button>
+            <button class="btn-chip highlight-green" onclick="setExact('R2_SHOUL_Servo',0)">0° Default</button>
+            <button class="btn-chip" onclick="nudge('R2_SHOUL_Servo',1)">+1°</button>
+            <button class="btn-chip" onclick="nudge('R2_SHOUL_Servo',5)">+5°</button>
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="setExact('R2_SHOUL_Servo',0)">0°</button>
+            <button class="btn-chip" onclick="setExact('R2_SHOUL_Servo',30)">30°</button>
+            <button class="btn-chip" onclick="setExact('R2_SHOUL_Servo',60)">60°</button>
+            <button class="btn-chip" onclick="setExact('R2_SHOUL_Servo',90)">90°</button>
+        </div>
+
+    </div>
+
+    <!-- L1 SHOULDER -->
+
+    <div class="card shoulder-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Front-Left Shoulder (L1)</div>
+                <div class="servo-pin">
+                    GPIO 13 · Allowed: 0°–90° · Default: 0°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_L1_SHOUL_Servo">0°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="L1_SHOUL_Servo"
+                   min="0" max="90" value="0"
+                   oninput="onSliderMove('L1_SHOUL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('L1_SHOUL_Servo',-5)">-5°</button>
+            <button class="btn-chip" onclick="nudge('L1_SHOUL_Servo',-1)">-1°</button>
+            <button class="btn-chip highlight-green" onclick="setExact('L1_SHOUL_Servo',0)">0° Default</button>
+            <button class="btn-chip" onclick="nudge('L1_SHOUL_Servo',1)">+1°</button>
+            <button class="btn-chip" onclick="nudge('L1_SHOUL_Servo',5)">+5°</button>
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="setExact('L1_SHOUL_Servo',0)">0°</button>
+            <button class="btn-chip" onclick="setExact('L1_SHOUL_Servo',30)">30°</button>
+            <button class="btn-chip highlight" onclick="setExact('L1_SHOUL_Servo',75)">75° Hi</button>
+            <button class="btn-chip" onclick="setExact('L1_SHOUL_Servo',90)">90°</button>
+        </div>
+
+    </div>
+
+    <!-- L2 SHOULDER -->
+
+    <div class="card shoulder-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Front-Right Shoulder (L2)</div>
+                <div class="servo-pin">
+                    GPIO 2 · Allowed: 0°–90° · Default: 90°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_L2_SHOUL_Servo">90°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="L2_SHOUL_Servo"
+                   min="0" max="90" value="90"
+                   oninput="onSliderMove('L2_SHOUL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('L2_SHOUL_Servo',-5)">-5°</button>
+            <button class="btn-chip" onclick="nudge('L2_SHOUL_Servo',-1)">-1°</button>
+            <button class="btn-chip highlight-green" onclick="setExact('L2_SHOUL_Servo',90)">90° Default</button>
+            <button class="btn-chip" onclick="nudge('L2_SHOUL_Servo',1)">+1°</button>
+            <button class="btn-chip" onclick="nudge('L2_SHOUL_Servo',5)">+5°</button>
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="setExact('L2_SHOUL_Servo',0)">0°</button>
+            <button class="btn-chip" onclick="setExact('L2_SHOUL_Servo',30)">30°</button>
+            <button class="btn-chip" onclick="setExact('L2_SHOUL_Servo',60)">60°</button>
+            <button class="btn-chip" onclick="setExact('L2_SHOUL_Servo',90)">90°</button>
+            <button class="btn-chip highlight" onclick="start360()">360 (x23)</button>
+            <button class="btn-chip" style="background:rgba(239,68,68,0.15);border-color:var(--danger);color:#f87171;" onclick="stop360()">Stop 360</button>
+        </div>
+
+    </div>
+
+</div>
+
+<!-- ================================================= -->
+<!-- ELBOW AND WALKING TAB                              -->
+<!-- ================================================= -->
+
+<div id="panel-elbows" class="panel">
+
+    <div class="card">
+
+        <div style="font-weight:700;margin-bottom:10px;color:#4dc3ff;">
+            Walking and Leg Presets
+        </div>
+
+        <div class="action-bar" style="margin-bottom:10px;">
+
+            <button class="action-btn btn-green" onclick="startWalking()">
+                START WALK
+            </button>
+
+            <button class="action-btn btn-red" onclick="stopWalking()">
+                STOP WALK
+            </button>
+
+            <button class="action-btn btn-accent" onclick="startHi()">
+                START HI
+            </button>
+
+            <button class="action-btn btn-red" onclick="stopHi()">
+                STOP HI
+            </button>
+
+            <button class="action-btn btn-purple" onclick="start360()">
+                360 (L2 x23)
+            </button>
+
+            <button class="action-btn btn-red" onclick="stop360()">
+                STOP 360
+            </button>
+
+        </div>
+
+        <div class="action-bar">
+
+            <button class="action-btn btn-blue" onclick="presetVertical()">
+                Vertical (70°/20°)
+            </button>
+
+            <button class="action-btn btn-blue" onclick="presetElbows45()">
+                All Elbows 45°
+            </button>
+
+            <button class="action-btn btn-dark" onclick="presetHorizontal()">
+                Horizontal (0°/90°)
+            </button>
+
+            <button class="action-btn btn-accent" onclick="presetShoulderWalk()">
+                Shoulder Walk Stance
+            </button>
+
+            <button class="action-btn btn-dark" onclick="presetDefault()">
+                Set All Defaults
+            </button>
+
+            <button class="action-btn" style="background:#0284c7;color:white;"
+                    onclick="openTab('ota',document.querySelector('.ota-tab-btn'))">
+                OTA Update
+            </button>
+
+        </div>
+
+    </div>
+
+    <!-- R3 ELBOW -->
+
+    <div class="card elbow-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Back-Right Leg (R3 Elbow)</div>
+                <div class="servo-pin">
+                    GPIO 4 · Allowed: 0°–180° · Default: 180°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_R3_EL_Servo">180°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="R3_EL_Servo"
+                   min="0" max="180" value="180"
+                   oninput="onSliderMove('R3_EL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('R3_EL_Servo',-5)">-5°</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('R3_EL_Servo',180)">180° Default</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('R3_EL_Servo',45)">45°</button>
+            <button class="btn-chip highlight" onclick="setExact('R3_EL_Servo',25)">25° Walk</button>
+            <button class="btn-chip" onclick="setExact('R3_EL_Servo',0)">0°</button>
+            <button class="btn-chip" onclick="nudge('R3_EL_Servo',5)">+5°</button>
+        </div>
+
+    </div>
+
+    <!-- L4 ELBOW -->
+
+    <div class="card elbow-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Front-Left Leg (L4 Elbow)</div>
+                <div class="servo-pin">
+                    GPIO 14 · Allowed: 0°–180° · Default: 0°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_L4_EL_Servo">0°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="L4_EL_Servo"
+                   min="0" max="180" value="0"
+                   oninput="onSliderMove('L4_EL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('L4_EL_Servo',-5)">-5°</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('L4_EL_Servo',0)">0° Default</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('L4_EL_Servo',45)">45°</button>
+            <button class="btn-chip highlight" onclick="startHi()">Start Hi</button>
+            <button class="btn-chip" onclick="stopHi()">Stop Hi</button>
+            <button class="btn-chip" onclick="setExact('L4_EL_Servo',90)">90°</button>
+            <button class="btn-chip" onclick="nudge('L4_EL_Servo',5)">+5°</button>
+        </div>
+
+    </div>
+
+    <!-- L3 ELBOW -->
+
+    <div class="card elbow-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Back-Left Leg (L3 Elbow)</div>
+                <div class="servo-pin">
+                    GPIO 5 · Allowed: 0°–180° · Default: 0°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_L3_EL_Servo">0°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="L3_EL_Servo"
+                   min="0" max="180" value="0"
+                   oninput="onSliderMove('L3_EL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('L3_EL_Servo',-5)">-5°</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('L3_EL_Servo',0)">0° Default</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('L3_EL_Servo',45)">45°</button>
+            <button class="btn-chip highlight" onclick="setExact('L3_EL_Servo',65)">65° Walk</button>
+            <button class="btn-chip highlight" onclick="setExact('L3_EL_Servo',105)">105° Balance</button>
+            <button class="btn-chip" onclick="setExact('L3_EL_Servo',90)">90°</button>
+            <button class="btn-chip" onclick="nudge('L3_EL_Servo',5)">+5°</button>
+        </div>
+
+    </div>
+
+    <!-- R4 ELBOW -->
+
+    <div class="card elbow-card">
+
+        <div class="card-header">
+
+            <div class="servo-info">
+                <div class="servo-title">Front-Right Leg (R4 Elbow)</div>
+                <div class="servo-pin">
+                    GPIO 27 · Allowed: 0°–180° · Default: 180°
+                </div>
+            </div>
+
+            <div class="angle-display" id="disp_R4_EL_Servo">180°</div>
+
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="R4_EL_Servo"
+                   min="0" max="180" value="180"
+                   oninput="onSliderMove('R4_EL_Servo')">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn-chip" onclick="nudge('R4_EL_Servo',-5)">-5°</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('R4_EL_Servo',180)">180° Default</button>
+            <button class="btn-chip highlight-blue" onclick="setExact('R4_EL_Servo',45)">45°</button>
+            <button class="btn-chip" onclick="setExact('R4_EL_Servo',0)">0°</button>
+            <button class="btn-chip" onclick="nudge('R4_EL_Servo',5)">+5°</button>
+        </div>
+
+    </div>
+
+</div>
+
+<!-- ================================================= -->
+<!-- EXPORT CALIBRATION TAB                             -->
+<!-- ================================================= -->
+
+<div id="panel-export" class="panel">
+
+    <div class="card">
+
+        <div style="font-weight:700;margin-bottom:8px;color:#4dc3ff;">
+            Calibrated Angle Definitions
+        </div>
+
+        <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:12px;line-height:1.5;">
+            Adjust each servo, then copy these positions into your sketch.
+            Shoulder angles are restricted to 0°–90°.
+        </p>
+
+        <div class="code-container">
+            <button class="copy-btn" onclick="copyCode()">Copy Code</button>
+            <pre id="exportedCode">// Calibrated Values</pre>
+        </div>
+
+    </div>
+
+</div>
+
+<!-- ================================================= -->
+<!-- OTA UPDATE TAB                                     -->
+<!-- ================================================= -->
+
+<div id="panel-ota" class="panel">
+
+    <div class="card" style="border-left:4px solid #38bdf8;">
+
+        <div style="font-weight:700;margin-bottom:8px;color:#38bdf8;">
+            Wireless Firmware Update
+        </div>
+
+        <p style="font-size:0.88rem;color:var(--text-muted);line-height:1.5;">
+            Upload a compiled .bin firmware file over Wi-Fi.
+        </p>
+
+        <input class="ota-file" type="file"
+               id="otaFileInput" accept=".bin">
+
+        <div id="otaProgressBar" class="progress-bar">
+            <div id="otaProgressFill" class="progress-fill"></div>
+        </div>
+
+        <div class="action-bar">
+
+            <button class="action-btn btn-green"
+                    id="otaUploadBtn"
+                    onclick="uploadFirmware()">
+                Upload & Flash Firmware
+            </button>
+
+            <button class="action-btn btn-dark"
+                    onclick="window.open('/update','_blank')">
+                Dedicated Page
+            </button>
+
+        </div>
+
+        <div id="otaStatusText"
+             style="margin-top:14px;font-size:0.9rem;line-height:1.5;">
+        </div>
+
+        <p style="margin-top:16px;font-size:0.82rem;line-height:1.6;">
+            In Arduino IDE, use Sketch → Export Compiled Binary.
+            Select the generated .bin file here and start the upload.
+        </p>
+
+    </div>
+
+</div>
+
+<div class="status-footer" id="statusMessage">
+    Connected to ESP32
+</div>
+
+<div style="text-align:center;padding:10px 0;">
+    <a href="/update"
+       style="color:#38bdf8;text-decoration:none;font-size:0.85rem;">
+        Dedicated OTA Page
+    </a>
+</div>
+
+</div>
+
+<script>
+
+// =====================================================
+// TAB SWITCHING
+// =====================================================
+
+function openTab(tabId, element) {
+
+    document.querySelectorAll('.panel').forEach(panel => {
+        panel.classList.remove('active');
+    });
+
+    document.querySelectorAll('.tab-btn').forEach(button => {
+        button.classList.remove('active');
+    });
+
+    document.getElementById('panel-' + tabId).classList.add('active');
+
+    if (element) {
+        element.classList.add('active');
+    }
+
+    if (tabId === 'export') {
+        updateExportCode();
+    }
+}
+
+// =====================================================
+// SERVO DEFAULT VALUES
+// =====================================================
+
+const servoDefaults = {
+    R1_SHOUL_Servo: 90,
+    R2_SHOUL_Servo: 0,
+    L1_SHOUL_Servo: 0,
+    L2_SHOUL_Servo: 90,
+
+    R3_EL_Servo: 180,
+    L4_EL_Servo: 0,
+    L3_EL_Servo: 0,
+    R4_EL_Servo: 180
+};
+
+function getMaxForServo(name) {
+
+    if (name.endsWith('_SHOUL_Servo')) {
+        return 90;
+    }
+
+    return 180;
+}
+
+// =====================================================
+// SEND ANGLE TO ESP32
+// =====================================================
+
+const pendingRequests = {};
+
+function sendServoAngle(name, angle) {
+
+    if (pendingRequests[name]) {
+        clearTimeout(pendingRequests[name]);
+    }
+
+    pendingRequests[name] = setTimeout(() => {
+
+        fetch('/servo?name=' + encodeURIComponent(name) +
+              '&angle=' + encodeURIComponent(angle))
+
+        .then(response => {
+
+            if (!response.ok) {
+                throw new Error('Servo command failed');
+            }
+
+            return response.text();
+        })
+
+        .then(message => {
+
+            if (message.startsWith('OUT_OF_RANGE_RESET_TO_DEFAULT')) {
+                refreshAllAngles();
+            }
+        })
+
+        .catch(error => {
+            console.error('Servo command error:', error);
+        });
+
+    }, 25);
+}
+
+// =====================================================
+// SLIDER CONTROL
+// =====================================================
+
+function onSliderMove(name) {
+
+    const slider = document.getElementById(name);
+
+    const maxAngle = getMaxForServo(name);
+
+    let angle = parseInt(slider.value, 10);
+
+    angle = Math.max(0, Math.min(maxAngle, angle));
+
+    slider.value = angle;
+
+    document.getElementById('disp_' + name).innerText =
+        angle + '°';
+
+    sendServoAngle(name, angle);
+}
+
+// =====================================================
+// SET EXACT ANGLE
+// =====================================================
+
+function setExact(name, angle) {
+
+    const slider = document.getElementById(name);
+
+    if (!slider) {
+        return;
+    }
+
+    const maxAngle = getMaxForServo(name);
+
+    angle = Math.max(0, Math.min(maxAngle, angle));
+
+    slider.value = angle;
+
+    document.getElementById('disp_' + name).innerText =
+        angle + '°';
+
+    sendServoAngle(name, angle);
+}
+
+// =====================================================
+// NUDGE BY A SMALL ANGLE
+// =====================================================
+
+function nudge(name, delta) {
+
+    const slider = document.getElementById(name);
+
+    if (!slider) {
+        return;
+    }
+
+    const current = parseInt(slider.value, 10);
+
+    setExact(name, current + delta);
+}
+
+// =====================================================
+// SYNCHRONIZE UI WITH ESP32 ANGLES
+// =====================================================
+
+function syncAngles(data) {
+
+    Object.keys(data).forEach(name => {
+
+        const slider = document.getElementById(name);
+        const display = document.getElementById('disp_' + name);
+
+        if (slider) {
+            slider.value = data[name];
+        }
+
+        if (display) {
+            display.innerText = data[name] + '°';
+        }
+    });
+}
+
+function refreshAllAngles() {
+
+    fetch('/angles')
+
+    .then(response => response.json())
+
+    .then(data => {
+        syncAngles(data);
+    })
+
+    .catch(error => {
+        console.error('Could not refresh servo angles:', error);
+    });
+}
+
+// =====================================================
+// SET ALL DEFAULTS
+// =====================================================
+
+function presetDefault() {
+
+    const button = document.getElementById('defaultButton');
+    const status = document.getElementById('statusMessage');
+
+    button.disabled = true;
+
+    status.innerText = 'Resetting all servos to default positions...';
+
+    // Show expected defaults immediately.
+    syncAngles(servoDefaults);
+
+    fetch('/preset?mode=default')
+
+    .then(response => {
+
+        if (!response.ok) {
+            throw new Error('Default reset failed');
+        }
+
+        return response.text();
+    })
+
+    .then(message => {
+
+        status.innerText = message;
+
+        return fetch('/angles');
+    })
+
+    .then(response => response.json())
+
+    .then(data => {
+
+        syncAngles(data);
+
+        status.innerText =
+            'All eight servos reset to calibrated defaults.';
+    })
+
+    .catch(error => {
+
+        console.error('Default reset error:', error);
+
+        status.innerText =
+            'Reset failed. Check the ESP32 Wi-Fi connection.';
+
+        refreshAllAngles();
+    })
+
+    .finally(() => {
+        button.disabled = false;
+    });
+}
+
+// =====================================================
+// SET ALL SHOULDERS
+// =====================================================
+
+function setAllShoulders(angle) {
+
+    angle = Math.max(0, Math.min(90, angle));
+
+    const names = [
+        'R1_SHOUL_Servo',
+        'R2_SHOUL_Servo',
+        'L1_SHOUL_Servo',
+        'L2_SHOUL_Servo'
+    ];
+
+    names.forEach((name, index) => {
+
+        const slider = document.getElementById(name);
+        const display = document.getElementById('disp_' + name);
+
+        if (slider) {
+            slider.value = angle;
+        }
+
+        if (display) {
+            display.innerText = angle + '°';
+        }
+
+        setTimeout(() => {
+            sendServoAngle(name, angle);
+        }, index * 35);
+    });
+}
+
+// =====================================================
+// SHOULDER WALK STANCE
+// =====================================================
+
+function presetShoulderWalk() {
+
+    fetch('/preset?mode=shoulder_walk')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            'Shoulder walking stance set: 90°, 0°, 15°, 75°.';
+
+        refreshAllAngles();
+    })
+
+    .catch(error => {
+        console.error('Shoulder preset error:', error);
+    });
+}
+
+// =====================================================
+// SHOULDER SWEEP TEST
+// =====================================================
+
+async function runSweepTest() {
+
+    const status = document.getElementById('statusMessage');
+
+    status.innerText = 'Running shoulder sweep test...';
+
+    // Sweep values remain within the 0-90 degree range.
+    const targets = [30, 60, 30, 60, 45];
+
+    for (const target of targets) {
+
+        setAllShoulders(target);
+
+        await new Promise(resolve => setTimeout(resolve, 450));
+    }
+
+    status.innerText = 'Shoulder sweep test complete.';
+
+    refreshAllAngles();
+}
+
+// =====================================================
+// ELBOW PRESETS
+// =====================================================
+
+function presetVertical() {
+
+    fetch('/preset?mode=vertical')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            'Vertical walking stance set.';
+
+        refreshAllAngles();
+    })
+
+    .catch(error => {
+        console.error('Vertical preset error:', error);
+    });
+}
+
+function presetHorizontal() {
+
+    fetch('/preset?mode=horizontal')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            'Horizontal position set.';
+
+        refreshAllAngles();
+    })
+
+    .catch(error => {
+        console.error('Horizontal preset error:', error);
+    });
+}
+
+function presetElbows45() {
+
+    fetch('/preset?mode=elbow_45')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            'All elbows set to 45 degrees.';
+
+        refreshAllAngles();
+    })
+
+    .catch(error => {
+        console.error('Elbow preset error:', error);
+    });
+}
+
+// =====================================================
+// WALK CONTROL
+// =====================================================
+
+function startWalking() {
+
+    fetch('/walk?state=1')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            'Walking started.';
+    })
+
+    .catch(error => {
+        console.error('Walk start error:', error);
+    });
+}
+
+function stopWalking() {
+
+    fetch('/walk?state=0')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            'Walking stopped.';
+
+        refreshAllAngles();
+    })
+
+    .catch(error => {
+        console.error('Walk stop error:', error);
+    });
+}
+
+// =====================================================
+// SAY HI CONTROL
+// =====================================================
+
+function startHi() {
+
+    fetch('/hi?state=1')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            message;
+    })
+
+    .catch(error => {
+        console.error('Start Hi error:', error);
+    });
+}
+
+function stopHi() {
+
+    fetch('/hi?state=0')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            message;
+
+        setTimeout(refreshAllAngles, 150);
+    })
+
+    .catch(error => {
+        console.error('Stop Hi error:', error);
+    });
+}
+
+function start360() {
+
+    fetch('/360?state=1')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            message;
+    })
+
+    .catch(error => {
+        console.error('Start 360 error:', error);
+    });
+}
+
+function stop360() {
+
+    fetch('/360?state=0')
+
+    .then(response => response.text())
+
+    .then(message => {
+
+        document.getElementById('statusMessage').innerText =
+            message;
+
+        setTimeout(refreshAllAngles, 150);
+    })
+
+    .catch(error => {
+        console.error('Stop 360 error:', error);
+    });
+}
+
+// =====================================================
+// EXPORT CALIBRATION CONSTANTS
+// =====================================================
+
+function updateExportCode() {
+
+    const r1 = document.getElementById('R1_SHOUL_Servo').value;
+    const r2 = document.getElementById('R2_SHOUL_Servo').value;
+    const l1 = document.getElementById('L1_SHOUL_Servo').value;
+    const l2 = document.getElementById('L2_SHOUL_Servo').value;
+
+    const r3 = document.getElementById('R3_EL_Servo').value;
+    const l4 = document.getElementById('L4_EL_Servo').value;
+    const l3 = document.getElementById('L3_EL_Servo').value;
+    const r4 = document.getElementById('R4_EL_Servo').value;
+
+    const code =
+`// Calibrated shoulder positions
+// Shoulder limits: 0-90 degrees
+
+#define CALIB_R1_SHOULDER ${r1}  // GPIO 12
+#define CALIB_R2_SHOULDER ${r2}  // GPIO 15
+#define CALIB_L1_SHOULDER ${l1}  // GPIO 13
+#define CALIB_L2_SHOULDER ${l2}  // GPIO 2
+
+// Calibrated elbow positions
+// Elbow limits: 0-180 degrees
+
+#define CALIB_R3_ELBOW ${r3}  // GPIO 4
+#define CALIB_L4_ELBOW ${l4}  // GPIO 14
+#define CALIB_L3_ELBOW ${l3}  // GPIO 5
+#define CALIB_R4_ELBOW ${r4}  // GPIO 27`;
+
+    document.getElementById('exportedCode').innerText = code;
+}
+
+function copyCode() {
+
+    const text = document.getElementById('exportedCode').innerText;
+
+    navigator.clipboard.writeText(text)
+
+    .then(() => {
+
+        const button = document.querySelector('.copy-btn');
+
+        button.innerText = 'Copied!';
+
+        setTimeout(() => {
+            button.innerText = 'Copy Code';
+        }, 1500);
+    })
+
+    .catch(() => {
+
+        alert('Clipboard access failed. Select and copy the code manually.');
+    });
+}
+
+// =====================================================
+// DISPLAY ESP32 IP ADDRESS
+// =====================================================
+
+fetch('/ip')
+
+.then(response => response.text())
+
+.then(ip => {
+    document.getElementById('ipDisplay').innerText = ip;
+})
+
+.catch(() => {
+    document.getElementById('ipDisplay').innerText = 'Connected';
+});
+
+// =====================================================
+// STATUS POLLING
+// =====================================================
+
+setInterval(() => {
+
+    fetch('/walkstatus')
+
+    .then(response => response.text())
+
+    .then(status => {
+
+        const message = document.getElementById('statusMessage');
+
+        if (status === '1') {
+            message.innerText = 'Walking in progress...';
+        }
+
+        else if (status === '2') {
+            message.innerText = 'Waving Hi...';
+        }
+    })
+
+    .catch(() => {});
+
+}, 700);
+
+// =====================================================
+// BROWSER OTA UPLOAD
+// =====================================================
+
+function uploadFirmware() {
+
+    const input = document.getElementById('otaFileInput');
+    const file = input.files[0];
+
+    if (!file) {
+        alert('Please select a compiled .bin file first.');
+        return;
+    }
+
+    const bar = document.getElementById('otaProgressBar');
+    const fill = document.getElementById('otaProgressFill');
+    const status = document.getElementById('otaStatusText');
+    const button = document.getElementById('otaUploadBtn');
+
+    bar.style.display = 'block';
+
+    button.disabled = true;
+
+    status.style.color = '#38bdf8';
+    status.innerText = 'Uploading firmware...';
+
+    const xhr = new XMLHttpRequest();
+
+    xhr.open('POST', '/update');
+
+    xhr.upload.onprogress = function(event) {
+
+        if (event.lengthComputable) {
+
+            const percent =
+                Math.round((event.loaded / event.total) * 100);
+
+            fill.style.width = percent + '%';
+
+            status.innerText = 'Flashing firmware: ' + percent + '%';
+        }
+    };
+
+    xhr.onload = function() {
+
+        if (xhr.status === 200) {
+
+            status.style.color = '#4ade80';
+            status.innerText = 'Firmware update complete. Rebooting...';
+
+            setTimeout(() => {
+                location.reload();
+            }, 8000);
+        }
+
+        else {
+
+            status.style.color = '#f87171';
+
+            status.innerText =
+                'Firmware update failed: ' + xhr.responseText;
+
+            button.disabled = false;
+        }
+    };
+
+    xhr.onerror = function() {
+
+        status.style.color = '#f87171';
+        status.innerText = 'Upload network error.';
+
+        button.disabled = false;
+    };
+
+    const data = new FormData();
+
+    data.append('update', file);
+
+    xhr.send(data);
+}
+
+// Fetch actual ESP32 positions when the page opens.
+refreshAllAngles();
+
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// =====================================================
+// OTA UPDATE PAGE
+// =====================================================
+
+const char OTA_page[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="utf-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Robot OTA Firmware Update</title>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: #f8fafc;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+}
+
+.card {
+    background: #1e293b;
+    padding: 2rem;
+    border-radius: 1rem;
+    width: 90%;
+    max-width: 440px;
+    text-align: center;
+    border: 1px solid #334155;
+}
+
+h2 {
+    color: #38bdf8;
+}
+
+p {
+    color: #94a3b8;
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.btn {
+    background: #2563eb;
+    color: white;
+    padding: 0.75rem 1.5rem;
+    border: none;
+    border-radius: 0.5rem;
+    font-weight: 600;
+    cursor: pointer;
+    width: 100%;
+    margin-top: 1rem;
+    font-size: 1rem;
+}
+
+.btn:disabled {
+    background: #475569;
+}
+
+input[type=file] {
+    margin: 1.5rem 0;
+    color: #94a3b8;
+    width: 100%;
+}
+
+.bar {
+    display: none;
+    width: 100%;
+    height: 12px;
+    background: #334155;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-top: 1.25rem;
+}
+
+.fill {
+    height: 100%;
+    width: 0%;
+    background: #38bdf8;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+    <h2>Firmware Update (OTA)</h2>
+
+    <p>
+        Upload a compiled .bin firmware binary to update your robot over Wi-Fi.
+    </p>
+
+    <form id="upload_form">
+
+        <input type="file" id="file_input" accept=".bin" required>
+
+        <div class="bar" id="bar">
+            <div class="fill" id="fill"></div>
+        </div>
+
+        <button type="submit" class="btn" id="btn">
+            Upload & Flash
+        </button>
+
+    </form>
+
+    <p id="status" style="margin-top:1.25rem;"></p>
+
+    <p>
+        <a href="/" style="color:#38bdf8;text-decoration:none;">
+            Return to Robot Controls
+        </a>
+    </p>
+
+</div>
+
+<script>
+
+const form = document.getElementById('upload_form');
+
+form.onsubmit = function(event) {
+
+    event.preventDefault();
+
+    const file = document.getElementById('file_input').files[0];
+
+    if (!file) {
+        return;
+    }
+
+    document.getElementById('bar').style.display = 'block';
+
+    document.getElementById('btn').disabled = true;
+
+    document.getElementById('status').innerText =
+        'Uploading firmware...';
+
+    const xhr = new XMLHttpRequest();
+
+    xhr.open('POST', '/update');
+
+    xhr.upload.onprogress = function(event) {
+
+        if (event.lengthComputable) {
+
+            const percent =
+                Math.round((event.loaded / event.total) * 100);
+
+            document.getElementById('fill').style.width =
+                percent + '%';
+
+            document.getElementById('status').innerText =
+                'Flashing: ' + percent + '%';
+        }
+    };
+
+    xhr.onload = function() {
+
+        if (xhr.status === 200) {
+
+            document.getElementById('status').innerText =
+                'Firmware update complete. Rebooting...';
+
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 8000);
+        }
+
+        else {
+
+            document.getElementById('status').innerText =
+                'Update failed: ' + xhr.responseText;
+
+            document.getElementById('btn').disabled = false;
+        }
+    };
+
+    xhr.onerror = function() {
+
+        document.getElementById('status').innerText =
+            'Upload network error.';
+
+        document.getElementById('btn').disabled = false;
+    };
+
+    const data = new FormData();
+
+    data.append('update', file);
+
+    xhr.send(data);
+};
+
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// =====================================================
+// HTTP ROOT HANDLER
+// =====================================================
+
+void handleRoot() {
+    server.send_P(200, "text/html", MAIN_page);
+}
+
+// =====================================================
+// HTTP SERVO HANDLER
+//
+// Out-of-range requests reset the servo to its default.
+// =====================================================
+
+void handleServo() {
+
+    if (!server.hasArg("name") || !server.hasArg("angle")) {
+
+        server.send(400, "text/plain", "Missing parameters");
+
+        return;
+    }
+
+    String name = server.arg("name");
+    String rawAngle = server.arg("angle");
+
+    if (getServoMaxAngle(name) < 0) {
+
+        server.send(400, "text/plain", "Unknown servo name");
+
+        return;
+    }
+
+    // Parse the complete angle string.
+    const char* start = rawAngle.c_str();
+
+    char* end = NULL;
+
+    errno = 0;
+
+    long requestedAngle = strtol(start, &end, 10);
+
+    if (start == end || *end != '\0' || errno == ERANGE) {
+
+        server.send(400, "text/plain", "Invalid angle");
+
+        return;
+    }
+
+    int maxAngle = getServoMaxAngle(name);
+
+    bool wasOutOfRange =
+        requestedAngle < 0 ||
+        requestedAngle > maxAngle;
+
+    if (!setServo(name, requestedAngle)) {
+
+        server.send(
+            503,
+            "text/plain",
+            "Servo busy or mutex unavailable"
+        );
+
+        return;
+    }
+
+    if (wasOutOfRange) {
+
+        int defaultAngle = getServoDefaultAngle(name);
+
+        Serial.printf(
+            "%s requested %ld degrees. Reset to %d degrees.\n",
+            name.c_str(),
+            requestedAngle,
+            defaultAngle
+        );
+
+        server.send(
+            200,
+            "text/plain",
+            "OUT_OF_RANGE_RESET_TO_DEFAULT: " +
+            String(defaultAngle)
+        );
+    }
+
+    else {
+
+        Serial.printf(
+            "%s set to %ld degrees.\n",
+            name.c_str(),
+            requestedAngle
+        );
+
+        server.send(200, "text/plain", "OK");
+    }
+}
+
+// =====================================================
+// RESET ALL EIGHT SERVOS TO DEFAULT POSITIONS
+// =====================================================
+
+void presetDefault() {
+
+    // Stop automatic movement before resetting the joints.
+    walking = false;
+    wavingHi = false;
+    spinning360 = false;
+
+    takeAllServoMutexes();
+
+    // Elbows
+    R3_EL_Servo.write(DEFAULT_R3_ELBOW);
+    angleR3_EL_Servo = DEFAULT_R3_ELBOW;
+    delay(25);
+
+    L4_EL_Servo.write(DEFAULT_L4_ELBOW);
+    angleL4_EL_Servo = DEFAULT_L4_ELBOW;
+    delay(25);
+
+    L3_EL_Servo.write(DEFAULT_L3_ELBOW);
+    angleL3_EL_Servo = DEFAULT_L3_ELBOW;
+    delay(25);
+
+    R4_EL_Servo.write(DEFAULT_R4_ELBOW);
+    angleR4_EL_Servo = DEFAULT_R4_ELBOW;
+    delay(25);
+
+    // Shoulders
+    R1_SHOUL_Servo.write(DEFAULT_R1_SHOULDER);
+    angleR1_SHOUL_Servo = DEFAULT_R1_SHOULDER;
+    delay(25);
+
+    R2_SHOUL_Servo.write(DEFAULT_R2_SHOULDER);
+    angleR2_SHOUL_Servo = DEFAULT_R2_SHOULDER;
+    delay(25);
+
+    L1_SHOUL_Servo.write(DEFAULT_L1_SHOULDER);
+    angleL1_SHOUL_Servo = DEFAULT_L1_SHOULDER;
+    delay(25);
+
+    L2_SHOUL_Servo.write(DEFAULT_L2_SHOULDER);
+    angleL2_SHOUL_Servo = DEFAULT_L2_SHOULDER;
+
+    giveAllServoMutexes();
+
+    walkPhase = 0;
+
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println("ALL SERVOS RESET TO DEFAULT POSITIONS");
+    Serial.println("==========================================");
+
+    Serial.printf("R1 Shoulder: %d degrees\n", angleR1_SHOUL_Servo);
+    Serial.printf("R2 Shoulder: %d degrees\n", angleR2_SHOUL_Servo);
+    Serial.printf("L1 Shoulder: %d degrees\n", angleL1_SHOUL_Servo);
+    Serial.printf("L2 Shoulder: %d degrees\n", angleL2_SHOUL_Servo);
+
+    Serial.printf("R3 Elbow: %d degrees\n", angleR3_EL_Servo);
+    Serial.printf("L4 Elbow: %d degrees\n", angleL4_EL_Servo);
+    Serial.printf("L3 Elbow: %d degrees\n", angleL3_EL_Servo);
+    Serial.printf("R4 Elbow: %d degrees\n", angleR4_EL_Servo);
+
+    Serial.println("==========================================");
+}
+
+// =====================================================
+// HTTP WALK HANDLER
+// =====================================================
+
+void handleWalk() {
+
+    if (!server.hasArg("state")) {
+
+        server.send(400, "text/plain", "Missing state");
+
+        return;
+    }
+
+    int state = server.arg("state").toInt();
+
+    if (state == 1) {
+
+        // Stop Hi and 360 before starting walking.
+        wavingHi = false;
+        spinning360 = false;
+        walking = false;
+
+        takeAllServoMutexes();
+
+        walkPhase = 0;
+
+        // Set calibrated shoulder walking stance.
+        R1_SHOUL_Servo.write(WALK_POS_R1_SHOULDER);
+        angleR1_SHOUL_Servo = WALK_POS_R1_SHOULDER;
+        delay(20);
+
+        R2_SHOUL_Servo.write(WALK_POS_R2_SHOULDER);
+        angleR2_SHOUL_Servo = WALK_POS_R2_SHOULDER;
+        delay(20);
+
+        L1_SHOUL_Servo.write(WALK_POS_L1_SHOULDER);
+        angleL1_SHOUL_Servo = WALK_POS_L1_SHOULDER;
+        delay(20);
+
+        L2_SHOUL_Servo.write(WALK_POS_L2_SHOULDER);
+        angleL2_SHOUL_Servo = WALK_POS_L2_SHOULDER;
+
+        giveAllServoMutexes();
+
+        walking = true;
+
+        Serial.println("Parallel walking started.");
+
+        server.send(200, "text/plain", "Walking");
+    }
+
+    else {
+
+        walking = false;
+
+        takeAllServoMutexes();
+
+        // Return elbows to the walking vertical stance.
+        R3_EL_Servo.write(VERTICAL_LEG_VALUE_OF_R3_EL_Servo);
+        angleR3_EL_Servo = VERTICAL_LEG_VALUE_OF_R3_EL_Servo;
+        delay(25);
+
+        L4_EL_Servo.write(VERTICAL_LEG_VALUE_OF_L4_EL_Servo);
+        angleL4_EL_Servo = VERTICAL_LEG_VALUE_OF_L4_EL_Servo;
+        delay(25);
+
+        L3_EL_Servo.write(VERTICAL_LEG_VALUE_OF_L3_EL_Servo);
+        angleL3_EL_Servo = VERTICAL_LEG_VALUE_OF_L3_EL_Servo;
+        delay(25);
+
+        R4_EL_Servo.write(VERTICAL_LEG_VALUE_OF_R4_EL_Servo);
+        angleR4_EL_Servo = VERTICAL_LEG_VALUE_OF_R4_EL_Servo;
+
+        giveAllServoMutexes();
+
+        Serial.println("Walking stopped.");
+
+        server.send(200, "text/plain", "Stopped");
+    }
+}
+
+// =====================================================
+// WALKING STATUS HANDLER
+// =====================================================
+
+void handleWalkStatus() {
+
+    if (walking) {
+        server.send(200, "text/plain", "1");
+    }
+
+    else if (wavingHi) {
+        server.send(200, "text/plain", "2");
+    }
+
+    else {
+        server.send(200, "text/plain", "0");
+    }
+}
+
+// =====================================================
+// SAY HI GESTURE
+// =====================================================
+
+void startHi() {
+
+    walking = false;
+    spinning360 = false;
+
+    if (!wavingHi) {
+
+        if (leftServoMutex != NULL &&
+            xSemaphoreTake(leftServoMutex, portMAX_DELAY) == pdTRUE) {
+
+            prevL4Angle = angleL4_EL_Servo;
+            prevL3Angle = angleL3_EL_Servo;
+            prevL1Angle = angleL1_SHOUL_Servo;
+
+            xSemaphoreGive(leftServoMutex);
+        }
+    }
+
+    waveTargetCycles = -1;
+    waveCycle = 0;
+    waveStep = 0;
+
+    lastWaveTime = 0;
+
+    wavingHi = true;
+
+    Serial.println("Say Hi gesture started.");
+}
+
+void sayHi(int cycles) {
+
+    if (cycles <= 0) {
+        startHi();
+        return;
+    }
+
+    walking = false;
+
+    if (!wavingHi) {
+
+        if (leftServoMutex != NULL &&
+            xSemaphoreTake(leftServoMutex, portMAX_DELAY) == pdTRUE) {
+
+            prevL4Angle = angleL4_EL_Servo;
+            prevL3Angle = angleL3_EL_Servo;
+            prevL1Angle = angleL1_SHOUL_Servo;
+
+            xSemaphoreGive(leftServoMutex);
+        }
+    }
+
+    waveTargetCycles = cycles;
+    waveCycle = 0;
+    waveStep = 0;
+
+    lastWaveTime = 0;
+
+    wavingHi = true;
+}
+
+void stopHi() {
+
+    takeAllServoMutexes();
+
+    if (wavingHi) {
+
+        wavingHi = false;
+
+        L4_EL_Servo.write(prevL4Angle);
+        angleL4_EL_Servo = prevL4Angle;
+        delay(35);
+
+        L1_SHOUL_Servo.write(prevL1Angle);
+        angleL1_SHOUL_Servo = prevL1Angle;
+        delay(35);
+
+        L3_EL_Servo.write(prevL3Angle);
+        angleL3_EL_Servo = prevL3Angle;
+
+        Serial.println("Say Hi stopped. Previous stance restored.");
+    }
+
+    giveAllServoMutexes();
+}
+
+void updateHi() {
+
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastWaveTime < HI_WAVE_DELAY) {
+        return;
+    }
+
+    lastWaveTime = currentTime;
+
+    // Step 0: L3 balance
+    if (waveStep == 0) {
+
+        L3_EL_Servo.write(HI_BALANCE_L3_ANGLE);
+        angleL3_EL_Servo = HI_BALANCE_L3_ANGLE;
+
+        waveStep = 1;
+    }
+
+    // Step 1: Raise L1 shoulder
+    else if (waveStep == 1) {
+
+        L1_SHOUL_Servo.write(HI_SHOULDER_L1_ANGLE);
+        angleL1_SHOUL_Servo = HI_SHOULDER_L1_ANGLE;
+
+        waveStep = 2;
+    }
+
+    // Step 2: Raise L4
+    else if (waveStep == 2) {
+
+        L4_EL_Servo.write(HI_WAVE_MAX_ANGLE);
+        angleL4_EL_Servo = HI_WAVE_MAX_ANGLE;
+
+        waveStep = 3;
+    }
+
+    // Step 3: Lower L4
+    else if (waveStep == 3) {
+
+        L4_EL_Servo.write(HI_WAVE_MIN_ANGLE);
+        angleL4_EL_Servo = HI_WAVE_MIN_ANGLE;
+
+        waveStep = 4;
+    }
+
+    // Step 4: Raise L4 again
+    else if (waveStep == 4) {
+
+        L4_EL_Servo.write(HI_WAVE_MAX_ANGLE);
+        angleL4_EL_Servo = HI_WAVE_MAX_ANGLE;
+
+        if (waveTargetCycles > 0) {
+
+            waveCycle++;
+
+            if (waveCycle >= waveTargetCycles) {
+                waveStep = 5;
+            }
+
+            else {
+                waveStep = 3;
+            }
+        }
+
+        else {
+            // Continuous waving
+            waveStep = 3;
+        }
+    }
+
+    // Step 5: Restore L4
+    else if (waveStep == 5) {
+
+        L4_EL_Servo.write(prevL4Angle);
+        angleL4_EL_Servo = prevL4Angle;
+
+        waveStep = 6;
+    }
+
+    // Step 6: Restore L1 shoulder
+    else if (waveStep == 6) {
+
+        L1_SHOUL_Servo.write(prevL1Angle);
+        angleL1_SHOUL_Servo = prevL1Angle;
+
+        waveStep = 7;
+    }
+
+    // Step 7: Restore L3
+    else if (waveStep == 7) {
+
+        L3_EL_Servo.write(prevL3Angle);
+        angleL3_EL_Servo = prevL3Angle;
+
+        wavingHi = false;
+
+        Serial.println("Say Hi gesture completed.");
+    }
+}
+
+// =====================================================
+// HTTP HI HANDLER
+// =====================================================
+
+void handleHi() {
+
+    int state = 1;
+
+    if (server.hasArg("state")) {
+        state = server.arg("state").toInt();
+    }
+
+    if (state == 0) {
+
+        stopHi();
+
+        server.send(200, "text/plain", "Say Hi Stopped");
+    }
+
+    else {
+
+        if (server.hasArg("cycles")) {
+
+            int cycles = server.arg("cycles").toInt();
+
+            sayHi(cycles);
+
+            server.send(
+                200,
+                "text/plain",
+                "Say Hi started for " + String(cycles) + " cycles"
+            );
+        }
+
+        else {
+
+            startHi();
+
+            server.send(200, "text/plain", "Waving Hi (Continuous)");
+        }
+    }
+}
+
+// =====================================================
+// 360 SPIN GESTURE (L2 x23) — Horizontal Position
+// =====================================================
+
+void start360(int cycles) {
+
+    walking = false;
+    wavingHi = false;
+
+    if (!spinning360) {
+
+        takeAllServoMutexes();
+
+        prevL2Angle = angleL2_SHOUL_Servo;
+
+        // Set elbows to horizontal (flat) position first.
+        R3_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_R3_EL_Servo);
+        angleR3_EL_Servo = HORIZONTAL_LEG_VALUE_OF_R3_EL_Servo;
+        delay(25);
+
+        L4_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_L4_EL_Servo);
+        angleL4_EL_Servo = HORIZONTAL_LEG_VALUE_OF_L4_EL_Servo;
+        delay(25);
+
+        L3_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_L3_EL_Servo);
+        angleL3_EL_Servo = HORIZONTAL_LEG_VALUE_OF_L3_EL_Servo;
+        delay(25);
+
+        R4_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_R4_EL_Servo);
+        angleR4_EL_Servo = HORIZONTAL_LEG_VALUE_OF_R4_EL_Servo;
+        delay(25);
+
+        // Start L2 shoulder at 90 (default).
+        L2_SHOUL_Servo.write(90);
+        angleL2_SHOUL_Servo = 90;
+
+        giveAllServoMutexes();
+    }
+
+    spin360TargetCycles = (cycles > 0) ? cycles : SPIN360_DEFAULT_CYCLES;
+    spin360Cycle = 0;
+    spin360Step = 0;
+
+    lastSpin360Time = 0;
+
+    spinning360 = true;
+
+    Serial.printf("360 Spin started for %d cycles (L2: 90->0, horizontal pose).\n", spin360TargetCycles);
+}
+
+void stop360() {
+
+    takeAllServoMutexes();
+
+    if (spinning360) {
+
+        spinning360 = false;
+
+        // Restore L2 shoulder to default.
+        L2_SHOUL_Servo.write(DEFAULT_L2_SHOULDER);
+        angleL2_SHOUL_Servo = DEFAULT_L2_SHOULDER;
+
+        Serial.println("360 Spin stopped. L2 default angle restored.");
+    }
+
+    giveAllServoMutexes();
+}
+
+void update360() {
+
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastSpin360Time < SPIN360_DELAY) {
+        return;
+    }
+
+    lastSpin360Time = currentTime;
+
+    // Step 0: Sweep L2 towards 0 (horizontal sweep out)
+    if (spin360Step == 0) {
+
+        L2_SHOUL_Servo.write(0);
+        angleL2_SHOUL_Servo = 0;
+
+        spin360Step = 1;
+    }
+
+    // Step 1: Return L2 towards 90 (horizontal sweep back)
+    else if (spin360Step == 1) {
+
+        L2_SHOUL_Servo.write(90);
+        angleL2_SHOUL_Servo = 90;
+
+        spin360Cycle++;
+
+        if (spin360Cycle >= spin360TargetCycles) {
+
+            spinning360 = false;
+            spin360Step = 0;
+
+            Serial.printf("360 Spin finished all %d cycles.\n", spin360TargetCycles);
+        }
+
+        else {
+            spin360Step = 0;
+        }
+    }
+}
+
+// =====================================================
+// HTTP 360 HANDLER
+// =====================================================
+
+void handle360() {
+
+    int state = 1;
+
+    if (server.hasArg("state")) {
+        state = server.arg("state").toInt();
+    }
+
+    if (state == 0) {
+
+        stop360();
+
+        server.send(200, "text/plain", "360 Spin Stopped");
+    }
+
+    else {
+
+        int cycles = SPIN360_DEFAULT_CYCLES;
+
+        if (server.hasArg("cycles")) {
+            cycles = server.arg("cycles").toInt();
+        }
+
+        start360(cycles);
+
+        server.send(
+            200,
+            "text/plain",
+            "360 Spin started (" + String(cycles) + " cycles)"
+        );
+    }
+}
+
+// =====================================================
+// HTTP PRESET HANDLER
+// =====================================================
+
+void handlePreset() {
+
+    if (!server.hasArg("mode")) {
+
+        server.send(400, "text/plain", "Missing mode");
+
+        return;
+    }
+
+    String mode = server.arg("mode");
+
+    // Restore all eight calibrated default positions.
+    if (mode == "default" || mode == "defaults") {
+
+        presetDefault();
+
+        server.send(
+            200,
+            "text/plain",
+            "All eight servos reset to calibrated defaults."
+        );
+
+        return;
+    }
+
+    if (mode == "hi" ||
+        mode == "say_hi" ||
+        mode == "start_hi") {
+
+        startHi();
+
+        server.send(200, "text/plain", "Waving Hi (Continuous)");
+
+        return;
+    }
+
+    if (mode == "stop_hi") {
+
+        stopHi();
+
+        server.send(200, "text/plain", "Say Hi Stopped");
+
+        return;
+    }
+
+    if (mode == "360" ||
+        mode == "spin360" ||
+        mode == "start_360") {
+
+        start360(SPIN360_DEFAULT_CYCLES);
+
+        server.send(200, "text/plain", "360 Spin started (23 cycles)");
+
+        return;
+    }
+
+    if (mode == "stop_360" || mode == "stop360") {
+
+        stop360();
+
+        server.send(200, "text/plain", "360 Spin Stopped");
+
+        return;
+    }
+
+    // Other presets stop both autonomous movements.
+    walking = false;
+    wavingHi = false;
+    spinning360 = false;
+
+    takeAllServoMutexes();
+
+    // -----------------------------------------------
+    // HORIZONTAL
+    // -----------------------------------------------
+
+    if (mode == "horizontal") {
+
+        R3_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_R3_EL_Servo);
+        angleR3_EL_Servo = HORIZONTAL_LEG_VALUE_OF_R3_EL_Servo;
+        delay(25);
+
+        L4_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_L4_EL_Servo);
+        angleL4_EL_Servo = HORIZONTAL_LEG_VALUE_OF_L4_EL_Servo;
+        delay(25);
+
+        L3_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_L3_EL_Servo);
+        angleL3_EL_Servo = HORIZONTAL_LEG_VALUE_OF_L3_EL_Servo;
+        delay(25);
+
+        R4_EL_Servo.write(HORIZONTAL_LEG_VALUE_OF_R4_EL_Servo);
+        angleR4_EL_Servo = HORIZONTAL_LEG_VALUE_OF_R4_EL_Servo;
+    }
+
+    // -----------------------------------------------
+    // VERTICAL WALKING STANCE
+    // -----------------------------------------------
+
+    else if (mode == "vertical") {
+
+        R3_EL_Servo.write(VERTICAL_LEG_VALUE_OF_R3_EL_Servo);
+        angleR3_EL_Servo = VERTICAL_LEG_VALUE_OF_R3_EL_Servo;
+        delay(25);
+
+        L4_EL_Servo.write(VERTICAL_LEG_VALUE_OF_L4_EL_Servo);
+        angleL4_EL_Servo = VERTICAL_LEG_VALUE_OF_L4_EL_Servo;
+        delay(25);
+
+        L3_EL_Servo.write(VERTICAL_LEG_VALUE_OF_L3_EL_Servo);
+        angleL3_EL_Servo = VERTICAL_LEG_VALUE_OF_L3_EL_Servo;
+        delay(25);
+
+        R4_EL_Servo.write(VERTICAL_LEG_VALUE_OF_R4_EL_Servo);
+        angleR4_EL_Servo = VERTICAL_LEG_VALUE_OF_R4_EL_Servo;
+    }
+
+    // -----------------------------------------------
+    // ALL ELBOWS 45 DEGREES
+    // -----------------------------------------------
+
+    else if (mode == "elbow_45" || mode == "45") {
+
+        R3_EL_Servo.write(DEG45_LEG_VALUE_OF_R3_EL_Servo);
+        angleR3_EL_Servo = DEG45_LEG_VALUE_OF_R3_EL_Servo;
+        delay(25);
+
+        L4_EL_Servo.write(DEG45_LEG_VALUE_OF_L4_EL_Servo);
+        angleL4_EL_Servo = DEG45_LEG_VALUE_OF_L4_EL_Servo;
+        delay(25);
+
+        L3_EL_Servo.write(DEG45_LEG_VALUE_OF_L3_EL_Servo);
+        angleL3_EL_Servo = DEG45_LEG_VALUE_OF_L3_EL_Servo;
+        delay(25);
+
+        R4_EL_Servo.write(DEG45_LEG_VALUE_OF_R4_EL_Servo);
+        angleR4_EL_Servo = DEG45_LEG_VALUE_OF_R4_EL_Servo;
+    }
+
+    // -----------------------------------------------
+    // SHOULDER WALKING STANCE
+    // -----------------------------------------------
+
+    else if (mode == "shoulder_walk") {
+
+        R1_SHOUL_Servo.write(WALK_POS_R1_SHOULDER);
+        angleR1_SHOUL_Servo = WALK_POS_R1_SHOULDER;
+        delay(25);
+
+        R2_SHOUL_Servo.write(WALK_POS_R2_SHOULDER);
+        angleR2_SHOUL_Servo = WALK_POS_R2_SHOULDER;
+        delay(25);
+
+        L1_SHOUL_Servo.write(WALK_POS_L1_SHOULDER);
+        angleL1_SHOUL_Servo = WALK_POS_L1_SHOULDER;
+        delay(25);
+
+        L2_SHOUL_Servo.write(WALK_POS_L2_SHOULDER);
+        angleL2_SHOUL_Servo = WALK_POS_L2_SHOULDER;
+    }
+
+    else {
+
+        giveAllServoMutexes();
+
+        server.send(400, "text/plain", "Unknown preset mode");
+
+        return;
+    }
+
+    giveAllServoMutexes();
+
+    server.send(200, "text/plain", "Preset applied");
+}
+
+// =====================================================
+// HTTP IP HANDLER
+// =====================================================
+
+void handleIP() {
+    server.send(200, "text/plain", WiFi.localIP().toString());
+}
+
+// =====================================================
+// HTTP READ CURRENT SERVO ANGLES
+// =====================================================
+
+void handleAngles() {
+
+    takeAllServoMutexes();
+
+    String json = "{";
+
+    json += "\"R1_SHOUL_Servo\":" + String(angleR1_SHOUL_Servo) + ",";
+    json += "\"R2_SHOUL_Servo\":" + String(angleR2_SHOUL_Servo) + ",";
+    json += "\"L1_SHOUL_Servo\":" + String(angleL1_SHOUL_Servo) + ",";
+    json += "\"L2_SHOUL_Servo\":" + String(angleL2_SHOUL_Servo) + ",";
+
+    json += "\"R3_EL_Servo\":" + String(angleR3_EL_Servo) + ",";
+    json += "\"L4_EL_Servo\":" + String(angleL4_EL_Servo) + ",";
+    json += "\"L3_EL_Servo\":" + String(angleL3_EL_Servo) + ",";
+    json += "\"R4_EL_Servo\":" + String(angleR4_EL_Servo);
+
+    json += "}";
+
+    giveAllServoMutexes();
+
+    server.send(200, "application/json", json);
+}
+
+// =====================================================
+// LEFT LEG TASK - CORE 0
+// =====================================================
+
+void leftLegTask(void *pvParameters) {
+
+    Serial.println("Left leg task running on Core 0.");
+
+    for (;;) {
+
+        uint32_t currentPhase = 0;
+
+        if (xTaskNotifyWait(
+                0,
+                0xFFFFFFFF,
+                &currentPhase,
+                pdMS_TO_TICKS(15)) == pdTRUE) {
+
+            if (walking &&
+                leftServoMutex != NULL &&
+                xSemaphoreTake(
+                    leftServoMutex,
+                    pdMS_TO_TICKS(15)) == pdTRUE) {
+
+                // Check again after acquiring the mutex.
+                if (walking) {
+
+                    if (currentPhase == 0) {
+
+                        // Phase 1
+                        int l4Val = 15;
+
+                        L4_EL_Servo.write(l4Val);
+                        angleL4_EL_Servo = l4Val;
+
+                        L3_EL_Servo.write(WALK_BACK_L3_MAX_ANGLE);
+                        angleL3_EL_Servo = WALK_BACK_L3_MAX_ANGLE;
+                    }
+
+                    else {
+
+                        // Phase 2
+                        int l4Val = WALK_FRONT_L4_MAX_ANGLE;
+
+                        L4_EL_Servo.write(l4Val);
+                        angleL4_EL_Servo = l4Val;
+
+                        int l3Val = constrain(
+                            VERTICAL_LEG_VALUE_OF_L3_EL_Servo
+                                - WALK_STEP + ADD,
+                            15,
+                            165
+                        );
+
+                        L3_EL_Servo.write(l3Val);
+                        angleL3_EL_Servo = l3Val;
+                    }
+                }
+
+                xSemaphoreGive(leftServoMutex);
+            }
+        }
+
+        // Say Hi runs on Core 0.
+        if (wavingHi &&
+            leftServoMutex != NULL &&
+            xSemaphoreTake(
+                leftServoMutex,
+                pdMS_TO_TICKS(10)) == pdTRUE) {
+
+            if (wavingHi) {
+                updateHi();
+            }
+
+            xSemaphoreGive(leftServoMutex);
+        }
+
+        // 360 Spin runs on Core 0.
+        if (spinning360 &&
+            leftServoMutex != NULL &&
+            xSemaphoreTake(
+                leftServoMutex,
+                pdMS_TO_TICKS(10)) == pdTRUE) {
+
+            if (spinning360) {
+                update360();
+            }
+
+            xSemaphoreGive(leftServoMutex);
+        }
+    }
+}
+
+// =====================================================
+// RIGHT LEG TASK - CORE 1
+// =====================================================
+
+void rightLegTask(void *pvParameters) {
+
+    Serial.println("Right leg task running on Core 1.");
+
+    for (;;) {
+
+        if (walking) {
+
+            int currentPhase = walkPhase;
+
+            // Synchronize the left leg task.
+            if (leftLegTaskHandle != NULL) {
+
+                xTaskNotify(
+                    leftLegTaskHandle,
+                    (uint32_t)currentPhase,
+                    eSetValueWithOverwrite
+                );
+            }
+
+            if (rightServoMutex != NULL &&
+                xSemaphoreTake(
+                    rightServoMutex,
+                    pdMS_TO_TICKS(15)) == pdTRUE) {
+
+                // Check again after acquiring the mutex.
+                if (walking) {
+
+                    if (currentPhase == 0) {
+
+                        // Phase 1
+                        int r4Val = constrain(
+                            VERTICAL_LEG_VALUE_OF_R4_EL_Servo
+                                - WALK_STEP + ADD,
+                            15,
+                            165
+                        );
+
+                        R4_EL_Servo.write(r4Val);
+                        angleR4_EL_Servo = r4Val;
+
+                        int r3Val = constrain(
+                            VERTICAL_LEG_VALUE_OF_R3_EL_Servo
+                                + WALK_STEP - ADD,
+                            15,
+                            165
+                        );
+
+                        R3_EL_Servo.write(r3Val);
+                        angleR3_EL_Servo = r3Val;
+                    }
+
+                    else {
+
+                        // Phase 2
+                        int r4Val = constrain(
+                            VERTICAL_LEG_VALUE_OF_R4_EL_Servo
+                                + WALK_STEP - ADD,
+                            15,
+                            165
+                        );
+
+                        R4_EL_Servo.write(r4Val);
+                        angleR4_EL_Servo = r4Val;
+
+                        R3_EL_Servo.write(WALK_BACK_R3_MAX_ANGLE);
+                        angleR3_EL_Servo = WALK_BACK_R3_MAX_ANGLE;
+                    }
+                }
+
+                xSemaphoreGive(rightServoMutex);
+            }
+
+            walkPhase = (walkPhase == 0) ? 1 : 0;
+
+            vTaskDelay(pdMS_TO_TICKS(DD));
+        }
+
+        else {
+
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+}
+
+// =====================================================
+// WEB OTA LOCK STATE
+// =====================================================
+
+bool webOtaLocksHeld = false;
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+    // Retained from your original code.
+    // A sound servo power supply is still required.
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println("ESP32 ROBOT CONTROLLER & CALIBRATOR");
+    Serial.println("==========================================");
+
+    // -------------------------------------------------
+    // 1. WIFI CONNECTION
+    // -------------------------------------------------
+
+    WiFi.mode(WIFI_STA);
+
+    WiFi.setAutoReconnect(true);
+
+    WiFi.setTxPower(WIFI_POWER_17dBm);
+
+    WiFi.begin(ssid, password);
+
+    Serial.print("Connecting to Wi-Fi");
+
+    int attempts = 0;
+
+    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+
+        delay(500);
+
+        Serial.print(".");
+
+        attempts++;
+    }
+
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+        Serial.println("Wi-Fi connected.");
+
+        Serial.print("ESP32 IP Address: ");
+
+        Serial.println(WiFi.localIP());
+
+        Serial.print("Signal strength: ");
+
+        Serial.print(WiFi.RSSI());
+
+        Serial.println(" dBm");
+    }
+
+    else {
+
+        Serial.println("Wi-Fi connection failed.");
+    }
+
+    // -------------------------------------------------
+    // 2. CREATE MUTEXES
+    // -------------------------------------------------
+
+    leftServoMutex = xSemaphoreCreateMutex();
+
+    rightServoMutex = xSemaphoreCreateMutex();
+
+    if (leftServoMutex == NULL || rightServoMutex == NULL) {
+
+        Serial.println("ERROR: Servo mutex creation failed.");
+
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    // -------------------------------------------------
+    // 3. INITIALIZE SERVO PWM
+    // -------------------------------------------------
+
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+
+    R3_EL_Servo.setPeriodHertz(50);
+    L4_EL_Servo.setPeriodHertz(50);
+    L3_EL_Servo.setPeriodHertz(50);
+    R4_EL_Servo.setPeriodHertz(50);
+
+    R1_SHOUL_Servo.setPeriodHertz(50);
+    R2_SHOUL_Servo.setPeriodHertz(50);
+    L1_SHOUL_Servo.setPeriodHertz(50);
+    L2_SHOUL_Servo.setPeriodHertz(50);
+
+    // -------------------------------------------------
+    // 4. ATTACH ELBOW SERVOS
+    // -------------------------------------------------
+
+    R3_EL_Servo.attach(R3_ELBOW);
+    delay(25);
+
+    L4_EL_Servo.attach(L4_ELBOW);
+    delay(25);
+
+    L3_EL_Servo.attach(L3_ELBOW);
+    delay(25);
+
+    R4_EL_Servo.attach(R4_ELBOW);
+    delay(25);
+
+    Serial.println("Elbow servos attached.");
+
+    // -------------------------------------------------
+    // 5. ATTACH SHOULDER SERVOS
+    // -------------------------------------------------
+
+    int chR1 = R1_SHOUL_Servo.attach(R1_SHOULDER);
+    delay(25);
+
+    int chR2 = R2_SHOUL_Servo.attach(R2_SHOULDER);
+    delay(25);
+
+    int chL1 = L1_SHOUL_Servo.attach(L1_SHOULDER);
+    delay(25);
+
+    int chL2 = L2_SHOUL_Servo.attach(L2_SHOULDER);
+    delay(25);
+
+    Serial.println("Shoulder servos attached.");
+
+    Serial.printf(
+        "R1 GPIO %d, channel %d\n",
+        R1_SHOULDER,
+        chR1
+    );
+
+    Serial.printf(
+        "R2 GPIO %d, channel %d\n",
+        R2_SHOULDER,
+        chR2
+    );
+
+    Serial.printf(
+        "L1 GPIO %d, channel %d\n",
+        L1_SHOULDER,
+        chL1
+    );
+
+    Serial.printf(
+        "L2 GPIO %d, channel %d\n",
+        L2_SHOULDER,
+        chL2
+    );
+
+    // -------------------------------------------------
+    // 6. INITIALIZE ALL EIGHT DEFAULT POSITIONS
+    // -------------------------------------------------
+
+    R3_EL_Servo.write(DEFAULT_R3_ELBOW);
+    delay(25);
+
+    L4_EL_Servo.write(DEFAULT_L4_ELBOW);
+    delay(25);
+
+    L3_EL_Servo.write(DEFAULT_L3_ELBOW);
+    delay(25);
+
+    R4_EL_Servo.write(DEFAULT_R4_ELBOW);
+    delay(25);
+
+    R1_SHOUL_Servo.write(DEFAULT_R1_SHOULDER);
+    delay(25);
+
+    R2_SHOUL_Servo.write(DEFAULT_R2_SHOULDER);
+    delay(25);
+
+    L1_SHOUL_Servo.write(DEFAULT_L1_SHOULDER);
+    delay(25);
+
+    L2_SHOUL_Servo.write(DEFAULT_L2_SHOULDER);
+
+    Serial.println();
+    Serial.println("Startup default positions:");
+    Serial.printf("R1 Shoulder: %d\n", DEFAULT_R1_SHOULDER);
+    Serial.printf("R2 Shoulder: %d\n", DEFAULT_R2_SHOULDER);
+    Serial.printf("L1 Shoulder: %d\n", DEFAULT_L1_SHOULDER);
+    Serial.printf("L2 Shoulder: %d\n", DEFAULT_L2_SHOULDER);
+
+    Serial.printf("R3 Elbow: %d\n", DEFAULT_R3_ELBOW);
+    Serial.printf("L4 Elbow: %d\n", DEFAULT_L4_ELBOW);
+    Serial.printf("L3 Elbow: %d\n", DEFAULT_L3_ELBOW);
+    Serial.printf("R4 Elbow: %d\n", DEFAULT_R4_ELBOW);
+
+    // -------------------------------------------------
+    // 7. START DUAL-CORE TASKS
+    // -------------------------------------------------
+
+    BaseType_t leftTaskResult = xTaskCreatePinnedToCore(
+        leftLegTask,
+        "LeftLegTask",
+        4096,
+        NULL,
+        2,
+        &leftLegTaskHandle,
+        0
+    );
+
+    BaseType_t rightTaskResult = xTaskCreatePinnedToCore(
+        rightLegTask,
+        "RightLegTask",
+        4096,
+        NULL,
+        2,
+        &rightLegTaskHandle,
+        1
+    );
+
+    if (leftTaskResult != pdPASS || rightTaskResult != pdPASS) {
+
+        Serial.println("ERROR: Could not create walking tasks.");
+    }
+
+    // -------------------------------------------------
+    // 8. HTTP ROUTES
+    // -------------------------------------------------
+
+    server.on("/", HTTP_GET, handleRoot);
+
+    server.on("/servo", HTTP_GET, handleServo);
+
+    server.on("/preset", HTTP_GET, handlePreset);
+
+    server.on("/walk", HTTP_GET, handleWalk);
+
+    server.on("/walkstatus", HTTP_GET, handleWalkStatus);
+
+    server.on("/hi", HTTP_GET, handleHi);
+
+    server.on("/starthi", HTTP_GET, []() {
+
+        startHi();
+
+        server.send(200, "text/plain", "Waving Hi (Continuous)");
+    });
+
+    server.on("/stophi", HTTP_GET, []() {
+
+        stopHi();
+
+        server.send(200, "text/plain", "Say Hi Stopped");
+    });
+
+    server.on("/360", HTTP_GET, handle360);
+
+    server.on("/start360", HTTP_GET, []() {
+
+        start360(SPIN360_DEFAULT_CYCLES);
+
+        server.send(200, "text/plain", "360 Spin Started (23 Cycles)");
+    });
+
+    server.on("/stop360", HTTP_GET, []() {
+
+        stop360();
+
+        server.send(200, "text/plain", "360 Spin Stopped");
+    });
+
+    server.on("/ip", HTTP_GET, handleIP);
+
+    server.on("/angles", HTTP_GET, handleAngles);
+
+    // -------------------------------------------------
+    // 9. BROWSER OTA ROUTES
+    // -------------------------------------------------
+
+    server.on("/update", HTTP_GET, []() {
+
+        server.send_P(200, "text/html", OTA_page);
+    });
+
+    server.on(
+        "/update",
+        HTTP_POST,
+
+        // Final response after upload processing.
+        []() {
+
+            server.sendHeader("Connection", "close");
+
+            if (Update.hasError()) {
+
+                server.send(
+                    500,
+                    "text/plain",
+                    "Firmware update failed."
+                );
+            }
+
+            else {
+
+                server.send(
+                    200,
+                    "text/plain",
+                    "Firmware update successful. Rebooting."
+                );
+
+                delay(500);
+
+                ESP.restart();
+            }
+        },
+
+        // Firmware data upload callback.
+        []() {
+
+            HTTPUpload& upload = server.upload();
+
+            if (upload.status == UPLOAD_FILE_START) {
+
+                Serial.printf(
+                    "Browser OTA started: %s\n",
+                    upload.filename.c_str()
+                );
+
+                walking = false;
+                wavingHi = false;
+
+                takeAllServoMutexes();
+
+                webOtaLocksHeld = true;
+
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+
+                    Update.printError(Serial);
+                }
+            }
+
+            else if (upload.status == UPLOAD_FILE_WRITE) {
+
+                if (Update.write(
+                    upload.buf,
+                    upload.currentSize
+                ) != upload.currentSize) {
+
+                    Update.printError(Serial);
+                }
+            }
+
+            else if (upload.status == UPLOAD_FILE_END) {
+
+                if (Update.end(true)) {
+
+                    Serial.printf(
+                        "Browser OTA successful: %u bytes\n",
+                        upload.totalSize
+                    );
+                }
+
+                else {
+
+                    Update.printError(Serial);
+                }
+
+                if (webOtaLocksHeld) {
+
+                    giveAllServoMutexes();
+
+                    webOtaLocksHeld = false;
+                }
+            }
+
+            else if (upload.status == UPLOAD_FILE_ABORTED) {
+
+                Serial.println("Browser OTA upload aborted.");
+
+                Update.abort();
+
+                if (webOtaLocksHeld) {
+
+                    giveAllServoMutexes();
+
+                    webOtaLocksHeld = false;
+                }
+            }
+        }
+    );
+
+    server.begin();
+
+    Serial.println("Web server started.");
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+        Serial.print("Open the control page at: http://");
+
+        Serial.println(WiFi.localIP());
+
+        Serial.print("Browser OTA page: http://");
+
+        Serial.print(WiFi.localIP());
+
+        Serial.println("/update");
+    }
+
+    // -------------------------------------------------
+    // 10. ARDUINO IDE OTA
+    // -------------------------------------------------
+
+    ArduinoOTA.setHostname("walking-robot");
+
+    ArduinoOTA.onStart([]() {
+
+        String type =
+            (ArduinoOTA.getCommand() == U_FLASH)
+                ? "sketch"
+                : "filesystem";
+
+        walking = false;
+        wavingHi = false;
+
+        takeAllServoMutexes();
+
+        Serial.println(
+            "ArduinoOTA started: " + type
+        );
+    });
+
+    ArduinoOTA.onEnd([]() {
+
+        Serial.println("ArduinoOTA update complete.");
+
+        giveAllServoMutexes();
+    });
+
+    ArduinoOTA.onProgress([](
+        unsigned int progress,
+        unsigned int total
+    ) {
+
+        if (total > 0) {
+
+            Serial.printf(
+                "OTA Progress: %u%%\r",
+                (progress * 100U) / total
+            );
+        }
+    });
+
+    ArduinoOTA.onError([](ota_error_t error) {
+
+        Serial.printf(
+            "ArduinoOTA Error[%u]\n",
+            error
+        );
+
+        giveAllServoMutexes();
+    });
+
+    ArduinoOTA.begin();
+
+    Serial.println("Arduino IDE OTA started.");
+    Serial.println("OTA hostname: walking-robot.local");
+
+    Serial.println("Dual-core robot controller initialized.");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+    server.handleClient();
+
+    ArduinoOTA.handle();
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+}
